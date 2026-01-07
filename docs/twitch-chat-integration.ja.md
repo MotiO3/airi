@@ -222,3 +222,100 @@ UX詳細
 次のアクション
 
 私がこれを実装する場合は、まず `packages/stage-ui/src/components/settings/TwitchSettings.vue` の雛形を作り、`packages/stage-shared/src/services/twitch-client.ts` の最小接続テストを追加します。作業に移してよければお知らせください。
+
+追記: これまでに実装した内容（現状）
+
+- ブラウザ側の最小クライアント
+  - `packages/stage-shared/src/services/twitch-client.ts` に WebSocket ベースの最小クライアントを追加しました。
+  - PING/PONG、PRIVMSG の簡易パース、`onMessage(handler)` サブスクライブ API を提供します。
+  - 目的: 設定 UI や開発用の受信テスト UI と素早く連携するための軽量クライアント。
+
+- UI（開発向け）
+  - `packages/stage-pages/src/pages/settings/providers/twitch-settings.vue` を追加しました。チャンネルと OAuth トークンを入力し、接続テスト・保存ができます。
+  - `packages/stage-pages/src/pages/devtools/twitch-test.vue` を追加しました。保存済み設定を使って接続し、受信チャットメッセージを一覧表示できます。
+
+- アプリ内ストア
+  - `packages/stage-ui/src/stores/modules/twitch-integration.ts` を追加しました。
+  - `useTwitchIntegrationStore` を通じて start/stop、受信メッセージのバッファリング、簡易 `forwardToProvider(providerId)` を実装しています（直近最大10件をまとめて送信する簡易フロー）。
+
+- サーバー側の安定実装（tmi.js ベース）
+  - `services/twitch-ingest` サービスを追加しました（MVP サーバー）:
+    - `services/twitch-ingest/src/index.js` : express + tmi.js + ws を使った小さなサービス。
+    - POST `/listen` で OAuth・ユーザー名・チャネル配列を受け取り tmi.js で接続、受信メッセージを WebSocket 接続クライアントへブロードキャストします。
+    - POST `/forward` は（環境変数 `OPENAI_API_KEY` が設定されていれば）OpenAI Chat API へ簡易フォワードができます。
+    - README を同梱しています（起動方法と簡単な API 仕様）。
+
+補足（現状の使い分け）
+- 開発や軽いテスト：ブラウザの最小クライアント + `devtools/twitch-test.vue` を使って素早く受信動作を確認できます。
+- 安定運用や大規模チャンネル：`services/twitch-ingest` を使いサーバー側で永続接続・再接続・レート管理を行うことを推奨します。
+
+簡易実行手順（サーバー）
+
+1. services/twitch-ingest に移動して依存を入れる:
+
+```bash
+cd services/twitch-ingest
+pnpm install
+```
+
+2. サービス起動（OpenAI 連携を使う場合は環境変数を指定）:
+
+```bash
+OPENAI_API_KEY=sk-... pnpm start
+```
+
+3. /listen エンドポイントに接続要求を投げる（例）:
+
+```json
+POST http://localhost:3001/listen
+{
+  "oauth": "<token_without_prefix>",
+  "username": "bot_username",
+  "channels": ["channel1", "channel2"]
+}
+```
+
+次に行うべきアクション（推奨プラン）
+
+以下はプライオリティを付けた短期（MVP）→中期→本番化のアクションリストです。各項目は私が実装・コミットできます。
+
+短期（今週〜数日） — MVP の完成と結合
+
+1. UI とサーバーの接続を結合する（推奨）
+   - `twitch-settings.vue` の「接続テスト/保存」を `/listen` に POST するように変更し、サーバーが起動している環境で自動的にチャンネルを監視できるようにします。
+   - `devtools/twitch-test.vue` を WebSocket（`ws://<host>:3001`）に接続して、サーバーからの `twitch:message` の受信を表示するように変更します。
+   - 成果: 管理画面からボタン一つでサーバー監視を開始・停止でき、アプリ側で受信が見える。
+
+2. `forwardToProvider` の動線確認と簡易統合テスト
+   - `useTwitchIntegrationStore.forwardToProvider` をボタン化して、選択したプロバイダに対して手動転送を実施できるようにします（devtools ページに追加）。
+   - 簡易の E2E: サーバー経由で受信 → devtools で確認 → 手動転送 → AI応答が返る（UI 表示）。
+
+中期（数週間） — 信頼性と安全性向上
+
+3. 本番向けのトークン管理と運用
+   - サーバー側でトークンを安全に保管（Vault / 環境変数 / シークレットマネージャ）する設計にする。
+   - UI 側はトークンを平文で置かず、サーバーを経由して接続情報を登録するフローにする。
+
+4. 再接続・バックオフ・レート制御の強化
+   - `services/twitch-ingest` における tmi.js の設定と、AI 転送に対するスロットリング（バッチ、閾値、429 応答時の指数バックオフ）を実装。
+
+5. メッセージパースとメタデータ強化
+   - IRC タグの詳細パース（バッジ、emotes、message-id）や、メッセージごとの言語判定/スパムスコアを付与。
+
+本番（必要に応じて） — 大規模運用とモデレーション
+
+6. EventSub / PubSub 連携
+   - サブスクライブ型のイベント（サブスクライブ、ビッツ、ホスト等）を取り込むため EventSub を追加。
+
+7. 自動モデレーションとフィルタのルールエンジン
+   - AI を使った有害性判定、自動フィルタ適用、モデレーターへのサジェスト実装。
+
+補足: 私が次に行う作業（提案）
+
+- まずは短期 1 と 2 を実施してワークフロー（管理画面 → サーバー監視 → アプリ受信 → 手動転送）の End-to-End を作ります。これで実運用前の UX と基本の安全チェックが確認できます。
+- 作業量は小分けでコミットします。最初のプルリクは UI の接続テストを `/listen` に繋げ、devtools 側に「Forward to provider」ボタンを追加する内容になります。
+
+---
+
+必要なら、今すぐ短期作業（UI とサーバーの接続結合）をこのブランチで実装します。続けてよければ「実装を開始してください」とお知らせください。
+
