@@ -387,7 +387,12 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
         undefined,
         {
           providerOptions: {
+            // default to Japanese and deterministic output; allow caller override
+            language: 'ja',
+            temperature: 0,
             abortSignal: abortController.signal,
+            // hint: this is human conversation in Japanese; request natural spoken transcription
+            prompt: 'これは人間同士の会話の録音です。話し言葉を自然な日本語の文章に書き起こしてください。句読点は適切に入れてください。',
             ...options?.providerOptions,
           },
         },
@@ -436,12 +441,91 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     }
   }
 
-  async function transcribeForRecording(recording: Blob | null | undefined) {
+  async function finalizeMediaRecorder(mediaRecorder: MediaRecorder, timeoutMs = 2000): Promise<Blob> {
+    return new Promise<Blob>((resolve, reject) => {
+      const chunks: Blob[] = []
+      let finished = false
+
+      const onData = (e: BlobEvent) => {
+        try {
+          if (e.data && e.data.size > 0) chunks.push(e.data)
+        }
+        catch {}
+      }
+
+      const onStop = () => {
+        cleanup()
+        finished = true
+        try {
+          const type = chunks[0]?.type || 'audio/webm'
+          resolve(new Blob(chunks, { type }))
+        }
+        catch (err) {
+          reject(err)
+        }
+      }
+
+      const onError = (ev: any) => {
+        cleanup()
+        reject(new Error('Recording error: ' + String(ev)))
+      }
+
+      const timeout = setTimeout(() => {
+        if (!finished) {
+          cleanup()
+          try {
+            const type = chunks[0]?.type || 'audio/webm'
+            resolve(new Blob(chunks, { type }))
+          }
+          catch (err) {
+            reject(err)
+          }
+        }
+      }, timeoutMs)
+
+      function cleanup() {
+        clearTimeout(timeout)
+        try {
+          mediaRecorder.removeEventListener('dataavailable', onData as any)
+          mediaRecorder.removeEventListener('stop', onStop as any)
+          mediaRecorder.removeEventListener('error', onError as any)
+        }
+        catch {}
+      }
+
+      mediaRecorder.addEventListener('dataavailable', onData as any)
+      mediaRecorder.addEventListener('stop', onStop as any)
+      mediaRecorder.addEventListener('error', onError as any)
+
+      // If already inactive, resolve immediately (no chunks may be present)
+      if (mediaRecorder.state === 'inactive') {
+        cleanup()
+        const type = chunks[0]?.type || 'audio/webm'
+        resolve(new Blob(chunks, { type }))
+      }
+    })
+  }
+
+  async function transcribeForRecording(recording: Blob | MediaRecorder | null | undefined) {
     if (!recording)
       return
 
     try {
-      if (recording && recording.size > 0) {
+      // If caller passed a MediaRecorder, finalize and gather its blobs first
+      let finalBlob: Blob | null = null
+      if (typeof window !== 'undefined' && recording && (recording as MediaRecorder) instanceof MediaRecorder) {
+        try {
+          finalBlob = await finalizeMediaRecorder(recording as MediaRecorder)
+        }
+        catch (err) {
+          // fallback: ignore and proceed if no blob
+          finalBlob = null
+        }
+      }
+
+      // If recording is already a Blob, use it; otherwise use finalized blob
+      const blobToSend = (recording instanceof Blob) ? recording : finalBlob
+      if (blobToSend && blobToSend.size > 0) {
         const providerId = activeTranscriptionProvider.value
         const provider = await providersStore.getProviderInstance<TranscriptionProviderWithExtraOptions<string, any>>(providerId)
         if (!provider) {
@@ -454,8 +538,17 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
           providerId,
           provider,
           model,
-          new File([recording], 'recording.wav'),
+          new File([blobToSend], 'recording.wav'),
+          undefined,
+          {
+            providerOptions: {
+              language: 'ja',
+              temperature: 0,
+              prompt: 'これは人間同士の会話の録音です。話し言葉を自然な日本語の文章に書き起こしてください。句読点は適切に入れてください。',
+            },
+          },
         )
+
         return result.mode === 'stream' ? await result.text : result.text
       }
     }
