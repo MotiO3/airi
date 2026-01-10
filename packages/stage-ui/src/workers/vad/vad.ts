@@ -108,7 +108,12 @@ export class VAD implements BaseVAD {
     const minSilenceDurationSamples = this.config.minSilenceDurationMs * sampleRateMs
     const speechPadSamples = this.config.speechPadMs * sampleRateMs
     const minSpeechDurationSamples = this.config.minSpeechDurationMs * sampleRateMs
-    const maxPrevBuffers = Math.ceil(speechPadSamples / this.config.newBufferSize)
+    // Increase buffer capacity to ensure we capture enough pre-speech audio
+    // Add 50% margin to account for variable chunk sizes
+    const maxPrevBuffers = Math.max(
+      Math.ceil((speechPadSamples * 1.5) / this.config.newBufferSize),
+      3, // Minimum 3 buffers to ensure coverage
+    )
 
     // If not currently in speech and the current buffer isn't speech,
     // store it in the previous buffers queue for potential padding
@@ -144,7 +149,28 @@ export class VAD implements BaseVAD {
     // Handle speech detection
     if (isSpeech) {
       if (!this.isRecording) {
-        // Speech just started
+        // Speech just started - prepend previous buffers for padding
+        const prevLength = this.prevBuffers.reduce((acc, b) => acc + b.length, 0)
+        
+        if (prevLength > 0) {
+          // Shift existing buffer content to make room for previous buffers
+          const tempBuffer = this.buffer.slice(0, this.bufferPointer)
+          let offset = 0
+          
+          // Copy previous buffers first
+          for (const prev of this.prevBuffers) {
+            this.buffer.set(prev, offset)
+            offset += prev.length
+          }
+          
+          // Copy existing content after previous buffers
+          this.buffer.set(tempBuffer, offset)
+          this.bufferPointer = offset + tempBuffer.length
+          
+          // Clear previous buffers as they're now in the main buffer
+          this.prevBuffers = []
+        }
+        
         this.emit('speech-start', undefined)
         this.emit('status', { type: 'info', message: 'Speech detected' })
       }
@@ -213,18 +239,21 @@ export class VAD implements BaseVAD {
     const duration = (this.bufferPointer / this.config.sampleRate) * 1000
     const overflowLength = overflow?.length ?? 0
 
-    // Create the final buffer with padding
+    // Create the final buffer with post-speech padding
+    // Note: Pre-speech padding is already included in the buffer (added at speech-start)
     const prevLength = this.prevBuffers.reduce((acc, b) => acc + b.length, 0)
     const finalBuffer = new Float32Array(prevLength + this.bufferPointer + speechPadSamples)
 
-    // Add previous buffers for pre-speech padding
+    // Add any remaining previous buffers (should be empty if speech-start worked correctly)
     let offset = 0
-    for (const prev of this.prevBuffers) {
-      finalBuffer.set(prev, offset)
-      offset += prev.length
+    if (this.prevBuffers.length > 0) {
+      for (const prev of this.prevBuffers) {
+        finalBuffer.set(prev, offset)
+        offset += prev.length
+      }
     }
 
-    // Add the main speech segment
+    // Add the main speech segment with post-padding
     finalBuffer.set(this.buffer.slice(0, this.bufferPointer + speechPadSamples), offset)
 
     // Emit the speech segment

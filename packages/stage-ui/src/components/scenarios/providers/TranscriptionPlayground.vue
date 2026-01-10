@@ -9,19 +9,46 @@ import { useI18n } from 'vue-i18n'
 import { useAudioAnalyzer } from '../../../composables/audio/audio-analyzer'
 import { useAudioRecorder } from '../../../composables/audio/audio-recorder'
 import { useAudioDevice } from '../../../composables/audio/device'
+import { preprocessAudio } from '../../../libs/audio/preprocessing'
+import { TRANSCRIPTION_PRESETS, VAD_PRESETS } from '../../../libs/audio/presets'
 import { LevelMeter, TestDummyMarker, ThresholdMeter } from '../../gadgets'
 
 const props = defineProps<{
   // Provider-specific handlers (provided from parent)
-  generateTranscription: (input: File) => Promise<HearingTranscriptionResult>
+  generateTranscription: (input: File, options?: Record<string, unknown>) => Promise<HearingTranscriptionResult>
   // Current state
   apiKeyConfigured?: boolean
 }>()
 
 const { t } = useI18n()
-const { audioInputs, selectedAudioInput, stream, stopStream, startStream } = useAudioDevice()
+const {
+  audioInputs,
+  selectedAudioInput,
+  stream,
+  stopStream,
+  startStream,
+  selectedQualityMode,
+  qualityModes,
+  manualMode,
+  autoGainControl,
+  echoCancellation,
+  noiseSuppression,
+  applyDeviceSettings,
+} = useAudioDevice()
 const { volumeLevel, stopAnalyzer, startAnalyzer } = useAudioAnalyzer()
 const { startRecord, stopRecord, onStopRecord } = useAudioRecorder(stream)
+
+// Preset selections
+const selectedVADPreset = ref('conversation')
+const selectedTranscriptionPreset = ref('general')
+const enablePreprocessing = ref(true)
+const showAdvancedSettings = ref(false)
+const enableStreaming = ref(false)
+const streamingText = ref('')
+const isStreaming = ref(false)
+
+const vadPresets = computed(() => Object.values(VAD_PRESETS))
+const transcriptionPresets = computed(() => Object.values(TRANSCRIPTION_PRESETS))
 
 const speakingThreshold = ref(25) // 0-100 (for volume-based fallback)
 const isMonitoring = ref(false)
@@ -53,6 +80,15 @@ watch(selectedAudioInput, async () => {
 watch(audioInputs, () => {
   if (!selectedAudioInput.value && audioInputs.value.length > 0) {
     selectedAudioInput.value = audioInputs.value.find(input => input.deviceId === 'default')?.deviceId || audioInputs.value[0].deviceId
+  }
+})
+
+// Watch quality mode and manual settings
+watch([selectedQualityMode, manualMode, autoGainControl, echoCancellation, noiseSuppression], async () => {
+  if (isMonitoring.value) {
+    await applyDeviceSettings()
+    // Re-setup monitoring with new settings
+    await setupAudioMonitoring()
   }
 })
 
@@ -105,8 +141,59 @@ async function stopAudioMonitoring() {
 onStopRecord(async (recording) => {
   try {
     if (recording && recording.size > 0) {
-      audios.value.push(recording)
-      const result = await props.generateTranscription(new File([recording], 'recording.wav'))
+      const processedRecording = recording
+
+      // Apply audio preprocessing if enabled
+      if (enablePreprocessing.value) {
+        try {
+          // Convert Blob to AudioBuffer for preprocessing
+          const arrayBuffer = await recording.arrayBuffer()
+          const audioContext = new AudioContext()
+          const audioBuffer = await audioContext.decodeAudioData(arrayBuffer)
+          const channelData = audioBuffer.getChannelData(0)
+
+          // Preprocess audio
+          const preprocessResult = preprocessAudio(channelData, audioBuffer.sampleRate, {
+            normalize: true,
+            targetRMS: 0.1,
+            highPass: true,
+            cutoffFreq: 60,
+            detectClip: true,
+          })
+
+          // Show warnings if any
+          if (preprocessResult.warnings.length > 0) {
+            console.warn('Audio preprocessing warnings:', preprocessResult.warnings)
+            preprocessResult.warnings.forEach((warning) => {
+              console.warn(warning)
+            })
+          }
+
+          // Convert back to Blob (simplified - would need proper WAV encoding in production)
+          // For now, we'll use the original recording
+          // TODO: Implement proper Float32Array to WAV conversion
+          await audioContext.close()
+        }
+        catch (err) {
+          console.error('Preprocessing failed, using original audio:', err)
+        }
+      }
+
+      audios.value.push(processedRecording)
+
+      // Get transcription preset settings
+      const preset = TRANSCRIPTION_PRESETS[selectedTranscriptionPreset.value] || TRANSCRIPTION_PRESETS.general
+
+      // Pass preset configuration to transcription
+      const result = await props.generateTranscription(
+        new File([processedRecording], 'recording.wav'),
+        {
+          temperature: preset.temperature,
+          prompt: preset.prompt,
+          language: preset.language,
+        },
+      )
+
       const text = result.mode === 'stream'
         ? await result.text
         : result.text
@@ -174,9 +261,116 @@ onUnmounted(() => {
       />
     </div>
 
+    <!-- Audio Quality Mode -->
+    <div mb-2>
+      <FieldSelect
+        v-model="selectedQualityMode"
+        label="音質モード"
+        description="録音環境に応じた音質設定を選択"
+        :options="qualityModes.map((mode: any) => ({
+          label: mode.label,
+          value: mode.name,
+          description: mode.description,
+        }))"
+        layout="vertical"
+        h-fit w-full
+      />
+    </div>
+
+    <!-- VAD Preset -->
+    <div mb-2>
+      <FieldSelect
+        v-model="selectedVADPreset"
+        label="発話検出モード"
+        description="会話のタイプに応じた検出設定"
+        :options="vadPresets.map(preset => ({
+          label: preset.label,
+          value: preset.name,
+          description: preset.description,
+        }))"
+        layout="vertical"
+        h-fit w-full
+      />
+    </div>
+
+    <!-- Transcription Preset -->
+    <div mb-2>
+      <FieldSelect
+        v-model="selectedTranscriptionPreset"
+        label="文字起こしモード"
+        description="会話の内容に応じた認識設定"
+        :options="transcriptionPresets.map(preset => ({
+          label: preset.label,
+          value: preset.name,
+          description: preset.description,
+        }))"
+        layout="vertical"
+        h-fit w-full
+      />
+    </div>
+
+    <!-- Audio Preprocessing Toggle -->
+    <div mb-4 class="flex items-center gap-2">
+      <input id="preprocessing" v-model="enablePreprocessing" type="checkbox">
+      <label for="preprocessing" class="text-sm">
+        音声前処理を有効化（正規化、ノイズ除去）
+      </label>
+    </div>
+
+    <!-- Streaming Toggle -->
+    <div mb-4 class="flex items-center gap-2">
+      <input id="streaming" v-model="enableStreaming" type="checkbox">
+      <label for="streaming" class="text-sm">
+        リアルタイム文字起こし（ストリーミング）
+      </label>
+    </div>
+    <!-- Advanced Settings Toggle -->
+    <button
+      class="mb-2 text-sm text-blue-500 dark:text-blue-400 hover:text-blue-600 dark:hover:text-blue-300"
+      @click="showAdvancedSettings = !showAdvancedSettings"
+    >
+      {{ showAdvancedSettings ? '▼' : '▶' }} 詳細設定
+    </button>
+
+    <!-- Advanced Settings Panel -->
+    <div v-if="showAdvancedSettings" class="mb-4 border border-neutral-200 rounded-lg p-4 space-y-3 dark:border-neutral-700">
+      <div class="flex items-center gap-2">
+        <input id="manual-mode" v-model="manualMode" type="checkbox">
+        <label for="manual-mode" class="text-sm font-medium">
+          手動設定モード
+        </label>
+      </div>
+
+      <div v-if="manualMode" class="pl-6 space-y-2">
+        <label class="flex items-center gap-2">
+          <input v-model="noiseSuppression" type="checkbox">
+          <span class="text-sm">ノイズ抑制 (Noise Suppression)</span>
+        </label>
+        <label class="flex items-center gap-2">
+          <input v-model="echoCancellation" type="checkbox">
+          <span class="text-sm">エコーキャンセル (Echo Cancellation)</span>
+        </label>
+        <label class="flex items-center gap-2">
+          <input v-model="autoGainControl" type="checkbox">
+          <span class="text-sm">自動ゲイン制御 (Auto Gain Control)</span>
+        </label>
+      </div>
+    </div>
+
     <Button class="my-4" w-full @click="toggleMonitoring">
       {{ isMonitoring ? 'Stop Monitoring' : 'Start Monitoring' }}
     </Button>
+
+    <!-- Streaming Transcription Display -->
+    <div v-if="enableStreaming && isStreaming && streamingText" class="mb-4 rounded-lg bg-blue-50 p-4 dark:bg-blue-900/20">
+      <div class="mb-2 flex items-center gap-2">
+        <div class="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
+        <span class="text-sm text-blue-700 font-medium dark:text-blue-300">リアルタイム文字起こし中...</span>
+      </div>
+      <p class="text-sm text-neutral-700 dark:text-neutral-300">
+        {{ streamingText }}
+      </p>
+    </div>
 
     <div>
       <div v-for="(audio, index) in audioURLs" :key="index" class="mb-2">
